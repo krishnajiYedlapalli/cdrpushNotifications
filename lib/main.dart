@@ -1,127 +1,290 @@
-import 'package:firebase_messaging/firebase_messaging.dart';
-import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:flutter_module_sample/dummy_screen.dart';
+// Copyright 2019 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
-void main() {
-  runApp(MyApp());
+// @dart=2.9
+
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+
+import 'message.dart';
+import 'message_list.dart';
+import 'permissions.dart';
+import 'token_monitor.dart';
+
+/// Define a top-level named handler which background/terminated messages will
+/// call.
+///
+/// To verify things are working, check out the native platform logs.
+Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  // If you're going to use other Firebase services in the background, such as Firestore,
+  // make sure you call `initializeApp` before using other Firebase services.
+  await Firebase.initializeApp();
+  print('Handling a background message ${message.messageId}');
 }
 
-class MyApp extends StatelessWidget {
-  // This widget is the root of your application.
-  @override
+/// Create a [AndroidNotificationChannel] for heads up notifications
+const AndroidNotificationChannel channel = AndroidNotificationChannel(
+  'high_importance_channel', // id
+  'High Importance Notifications', // title
+  'This channel is used for important notifications.', // description
+  importance: Importance.high,
+);
 
+/// Initialize the [FlutterLocalNotificationsPlugin] package.
+final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
+FlutterLocalNotificationsPlugin();
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
+
+  // Set the background messaging handler early on, as a named top-level function
+  FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
+
+  /// Create an Android Notification Channel.
+  ///
+  /// We use this channel in the `AndroidManifest.xml` file to override the
+  /// default FCM channel to enable heads up notifications.
+  await flutterLocalNotificationsPlugin
+      .resolvePlatformSpecificImplementation<
+      AndroidFlutterLocalNotificationsPlugin>()
+      ?.createNotificationChannel(channel);
+
+  /// Update the iOS foreground notification presentation options to allow
+  /// heads up notifications.
+  await FirebaseMessaging.instance.setForegroundNotificationPresentationOptions(
+    alert: true,
+    badge: true,
+    sound: true,
+  );
+
+  runApp(MessagingExampleApp());
+}
+
+/// Entry point for the example application.
+class MessagingExampleApp extends StatelessWidget {
+  @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
-      theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // Try running your application with "flutter run". You'll see the
-        // application has a blue toolbar. Then, without quitting the app, try
-        // changing the primarySwatch below to Colors.green and then invoke
-        // "hot reload" (press "r" in the console where you ran "flutter run",
-        // or simply save your changes to "hot reload" in a Flutter IDE).
-        // Notice that the counter didn't reset back to zero; the application
-        // is not restarted.
-        primarySwatch: Colors.blue,
-      ),
-      home: MyHomePage(title: 'Flutter Demo Home Page'),
+      title: 'Messaging Example App',
+      theme: ThemeData.dark(),
+      routes: {
+        '/': (context) => Application(),
+        '/message': (context) => MessageView(),
+      },
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  MyHomePage({Key key, this.title}) : super(key: key);
+// Crude counter to make messages unique
+int _messageCount = 0;
 
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
-
-  @override
-  _MyHomePageState createState() => _MyHomePageState();
+/// The API endpoint here accepts a raw FCM payload for demonstration purposes.
+String constructFCMPayload(String token) {
+  _messageCount++;
+  return jsonEncode({
+    'token': token,
+    'data': {
+      'via': 'FlutterFire Cloud Messaging!!!',
+      'count': _messageCount.toString(),
+    },
+    'notification': {
+      'title': 'Hello FlutterFire!',
+      'body': 'This notification (#$_messageCount) was created via FCM!',
+    },
+  });
 }
 
-class _MyHomePageState extends State<MyHomePage> {
+/// Renders the example application.
+class Application extends StatefulWidget {
+  @override
+  State<StatefulWidget> createState() => _Application();
+}
 
-  String messageTitle = "Empty";
-  String notificationAlert = "alert";
-  String refreshedToken = 'No Token';
-  FirebaseMessaging _firebaseMessaging = FirebaseMessaging();
-
+class _Application extends State<Application> {
+  String _token;
 
   @override
   void initState() {
-    // TODO: implement initState
     super.initState();
-    getToken();
+    FirebaseMessaging.instance
+        .getInitialMessage()
+        .then((RemoteMessage message) {
+      if (message != null) {
+        Navigator.pushNamed(context, '/message',
+            arguments: MessageArguments(message, true));
+      }
+    });
 
-    _firebaseMessaging.configure(
-      onMessage: (Map<String, dynamic> message) async {
-        print("onMessage: $message");
-        // _navigateToItemDetail(message);
-      },
-      onLaunch: (Map<String, dynamic> message) async {
-        print("onLaunch: $message");
-        _navigateToItemDetail(message);
-      },
-      onResume: (Map<String, dynamic> message) async {
-        print("onResume: $message");
-        _navigateToItemDetail(message);
-      },
-      onBackgroundMessage: (Map<String, dynamic> message) async {
-        print("onBackground: $message");
-        _navigateToItemDetail(message);
-      },
-    );
+    FirebaseMessaging.onMessage.listen((RemoteMessage message) {
+      RemoteNotification notification = message.notification;
+      AndroidNotification android = message.notification?.android;
+      if (notification != null && android != null) {
+        flutterLocalNotificationsPlugin.show(
+            notification.hashCode,
+            notification.title,
+            notification.body,
+            NotificationDetails(
+              android: AndroidNotificationDetails(
+                channel.id,
+                channel.name,
+                channel.description,
+                // TODO add a proper drawable resource to android, for now using
+                //      one that already exists in example app.
+                icon: 'launch_background',
+              ),
+            ));
+      }
+    });
+
+    FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) {
+      print('A new onMessageOpenedApp event was published!');
+      Navigator.pushNamed(context, '/message',
+          arguments: MessageArguments(message, true));
+    });
   }
 
-  void _navigateToItemDetail(Map<String, dynamic> message) {
-      Navigator.push(context, MaterialPageRoute(builder: (_)=> DummyScreen()));
+  Future<void> sendPushMessage() async {
+    if (_token == null) {
+      print('Unable to send FCM message, no token exists.');
+      return;
+    }
+
+    try {
+    var response =  await http.post(
+        Uri.parse('https://api.rnfirebase.io/messaging/send'),
+        headers: <String, String>{
+          'Content-Type': 'application/json; charset=UTF-8',
+        },
+        body: constructFCMPayload(_token),
+      );
+    if(response != null){
+      print(response);
+    }
+      print('FCM request for device sent!');
+    } on Exception catch (e) {
+      print(e);
+    }
   }
 
-  getToken() async {
-     refreshedToken = await FirebaseMessaging().getToken();
-     setState(() {
-       print(refreshedToken);
-     });
+  Future<void> onActionSelected(String value) async {
+    switch (value) {
+      case 'subscribe':
+        {
+          print(
+              'FlutterFire Messaging Example: Subscribing to topic "fcm_test".');
+          await FirebaseMessaging.instance.subscribeToTopic('fcm_test');
+          print(
+              'FlutterFire Messaging Example: Subscribing to topic "fcm_test" successful.');
+        }
+        break;
+      case 'unsubscribe':
+        {
+          print(
+              'FlutterFire Messaging Example: Unsubscribing from topic "fcm_test".');
+          await FirebaseMessaging.instance.unsubscribeFromTopic('fcm_test');
+          print(
+              'FlutterFire Messaging Example: Unsubscribing from topic "fcm_test" successful.');
+        }
+        break;
+      case 'get_apns_token':
+        {
+          if (defaultTargetPlatform == TargetPlatform.iOS ||
+              defaultTargetPlatform == TargetPlatform.macOS) {
+            print('FlutterFire Messaging Example: Getting APNs token...');
+            String token = await FirebaseMessaging.instance.getAPNSToken();
+            print('FlutterFire Messaging Example: Got APNs token: $token');
+          } else {
+            print(
+                'FlutterFire Messaging Example: Getting an APNs token is only supported on iOS and macOS platforms.');
+          }
+        }
+        break;
+      default:
+        break;
+    }
   }
 
+  @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(widget.title),
+        title: const Text('Cloud Messaging'),
+        actions: <Widget>[
+          PopupMenuButton(
+            onSelected: onActionSelected,
+            itemBuilder: (BuildContext context) {
+              return [
+                const PopupMenuItem(
+                  value: 'subscribe',
+                  child: Text('Subscribe to topic'),
+                ),
+                const PopupMenuItem(
+                  value: 'unsubscribe',
+                  child: Text('Unsubscribe to topic'),
+                ),
+                const PopupMenuItem(
+                  value: 'get_apns_token',
+                  child: Text('Get APNs token (Apple only)'),
+                ),
+              ];
+            },
+          ),
+        ],
       ),
-      body: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            Text(
-              notificationAlert,
-            ),
-            Text(
-              messageTitle,
-              style: Theme.of(context).textTheme.headline4,
-            ),
-            FlatButton(
-              onPressed: (){
-                Clipboard.setData(new ClipboardData(text: "$refreshedToken"));
-              },
-              child: Text(
-                '$refreshedToken',
-                style: TextStyle(fontSize: 8),
-              ),
-            ),
-          ],
+      floatingActionButton: Builder(
+        builder: (context) => FloatingActionButton(
+          onPressed: sendPushMessage,
+          backgroundColor: Colors.white,
+          child: const Icon(Icons.send),
         ),
       ),
+      body: SingleChildScrollView(
+        child: Column(children: [
+          MetaCard('Permissions', Permissions()),
+          MetaCard('FCM Token', TokenMonitor((token) {
+            _token = token;
+            return token == null
+                ? const CircularProgressIndicator()
+                : Text(token, style: const TextStyle(fontSize: 12));
+          })),
+          MetaCard('Message Stream', MessageList()),
+        ]),
+      ),
     );
+  }
+}
+
+/// UI Widget for displaying metadata.
+class MetaCard extends StatelessWidget {
+  final String _title;
+  final Widget _children;
+
+  // ignore: public_member_api_docs
+  MetaCard(this._title, this._children);
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+        width: double.infinity,
+        margin: const EdgeInsets.only(left: 8, right: 8, top: 8),
+        child: Card(
+            child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(children: [
+                  Container(
+                      margin: const EdgeInsets.only(bottom: 16),
+                      child:
+                      Text(_title, style: const TextStyle(fontSize: 18))),
+                  _children,
+                ]))));
   }
 }
